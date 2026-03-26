@@ -32,20 +32,22 @@ class WordEntry:
 
 # ── Header Matching ───────────────────────────────────────────────────────────
 
-SOURCE_HEADER_REGEX = re.compile(r"^(english|en|source|original)$", re.IGNORECASE)
-TARGET_HEADER_REGEX = re.compile(r"^(dutch|nl|target|vertaling|translation)$", re.IGNORECASE)
+# Match any column containing English, EN, Source, or Original (even with extra text)
+SOURCE_HEADER_REGEX = re.compile(r".*(english|en|source|original).*", re.IGNORECASE)
+# Match any column containing Dutch, NL, Target, or Translation (even with extra text)
+TARGET_HEADER_REGEX = re.compile(r".*(dutch|nl|target|vertaling|translation).*", re.IGNORECASE)
 
 def _find_columns(ws) -> Tuple[Optional[int], Optional[int], int]:
     """
-    Search first 5 rows for column indices of Source and Target.
+    Search first 10 rows for column indices of Source and Target.
     Return (source_col, target_col, header_row_index).
     """
     source_col = None
     target_col = None
     header_row_idx = 0
 
-    # Look through first 5 rows to find headers
-    for row_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=5), start=1):
+    # Look through first 10 rows to find headers (expanded from 5)
+    for row_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=10), start=1):
         for cell in row:
             val = str(cell.value).strip() if cell.value else ""
             if not val:
@@ -57,6 +59,10 @@ def _find_columns(ws) -> Tuple[Optional[int], Optional[int], int]:
             elif TARGET_HEADER_REGEX.match(val):
                 target_col = cell.column
                 header_row_idx = row_idx
+        
+        # If we found both, we can stop the loop early
+        if source_col and target_col:
+            break
     
     # Fallback: if no source found but sheet has data, assume Col 1 is source
     if source_col is None:
