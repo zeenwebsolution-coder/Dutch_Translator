@@ -1,11 +1,25 @@
 """
 config.py — Central configuration for the Dutch translator.
-All constants, model names, and tunable settings live here.
+Updated for Multi-Model support (OpenAI, Anthropic, Google).
 """
 
-# ── Models ────────────────────────────────────────────────────────────────────
-TRANSLATION_MODEL   = "gpt-4o-mini"
-EMBEDDING_MODEL     = "text-embedding-3-small"   # used by LangChain OpenAIEmbeddings
+# ── Providers & Models ────────────────────────────────────────────────────────
+PROVIDERS = {
+    "OpenAI": {
+        "chat_model": "gpt-4o",
+        "embed_model": "text-embedding-3-small",
+    },
+    "Anthropic": {
+        "chat_model": "claude-3-5-sonnet-20240620",
+        "embed_model": None,  # Anthropic doesn't have native embeddings API yet
+    },
+    "Google": {
+        "chat_model": "gemini-1.5-pro",
+        "embed_model": "models/embedding-001",
+    }
+}
+
+DEFAULT_PROVIDER = "OpenAI"
 
 # ── RAG settings ──────────────────────────────────────────────────────────────
 CHUNK_SIZE          = 200      # characters per tone chunk
@@ -19,17 +33,13 @@ TEMPERATURE         = 0.1      # near-deterministic — accuracy first
 MAX_TOKENS          = 2000     # sufficient headroom for larger batches
 
 # ── Smart batch sizing ───────────────────────────────────────────────────────
-# Batch size is determined dynamically based on total unique words in a file.
-# gpt-4o-mini handles larger batches well — no need for conservative fixed 10.
 BATCH_THRESHOLDS = [
-    # (max_words, batch_size)
-    (15,   15),     # tiny files: send all at once
-    (50,   20),     # small files: batches of 20
-    (200,  30),     # medium files: batches of 30
-    (500,  40),     # large files: batches of 40
+    (15,   15),
+    (50,   20),
+    (200,  30),
+    (500,  40),
 ]
-DEFAULT_BATCH_SIZE = 50  # very large files: batches of 50
-
+DEFAULT_BATCH_SIZE = 50
 
 def compute_batch_size(total_unique_words: int) -> int:
     """Pick the optimal batch size based on how many unique words the file has."""
@@ -38,34 +48,17 @@ def compute_batch_size(total_unique_words: int) -> int:
             return min(size, total_unique_words) or 1
     return DEFAULT_BATCH_SIZE
 
-
 # ── Tone loader ───────────────────────────────────────────────────────────────
 MAX_TONE_CHARS      = 8000     # cap raw tone text before chunking
 
 # ── Business domains ──────────────────────────────────────────────────────────
-DOMAINS = [
-    "General Business",
-    "Finance & Accounting",
-    "HR & People Management",
-    "Sales & Marketing",
-    "Legal & Compliance",
-    "Operations & Logistics",
-    "IT & Technology",
-    "Customer Service",
-]
+DOMAINS = ["General Business", "Finance & Accounting", "HR & People Management", 
+           "Sales & Marketing", "Legal & Compliance", "Operations & Logistics", 
+           "IT & Technology", "Customer Service"]
 
 # ── Formality levels ──────────────────────────────────────────────────────────
 FORMALITY_OPTIONS = {
-    "Formal (u-form)": (
-        "Use formal Dutch throughout. Address implied subjects with 'u'. "
-        "Prefer formal, professional terminology as used in official business documents."
-    ),
-    "Semi-formal": (
-        "Use semi-formal Dutch. A professional yet approachable register, "
-        "suitable for internal business communication."
-    ),
-    "Neutral": (
-        "Use neutral, standard Dutch (ABN — Algemeen Beschaafd Nederlands). "
-        "Avoid overly formal or colloquial expressions."
-    ),
+    "Formal (u-form)": "Use formal Dutch throughout. Address implied subjects with 'u'.",
+    "Semi-formal": "Use semi-formal Dutch. A professional yet approachable register.",
+    "Neutral": "Use neutral, standard Dutch (ABN)."
 }

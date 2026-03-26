@@ -1,11 +1,6 @@
 """
-translator.py — GPT-4o-mini translation engine with LangChain RAG & Persistent Cache.
-
-For every batch of English words:
-  1. Check persistent SQLite cache for existing translations.
-  2. Retrieve relevant tone chunks via LangChain RAG for the remaining words.
-  3. Call OpenAI and parse the JSON response.
-  4. Update the persistent cache with new results.
+translator.py — Logic to call multi-provider LLMs (OpenAI, Claude, Gemini).
+Unified via LangChain's Chat Model interface.
 """
 
 from __future__ import annotations
@@ -15,16 +10,13 @@ import re
 import time
 import logging
 import streamlit as st
-from typing import Sequence, Dict, List, Optional
+from typing import Sequence, Dict, List, Optional, Any
 
-from openai import OpenAI
+from langchain_core.messages import SystemMessage, HumanMessage
 from modules.config import (
-    TRANSLATION_MODEL,
     MAX_RETRIES,
-    TEMPERATURE,
-    MAX_TOKENS,
-    FORMALITY_OPTIONS,
     TOP_K_CHUNKS,
+    FORMALITY_OPTIONS,
 )
 from modules.rag_engine import RAGStore, retrieve_tone_context
 from modules.cache_manager import CacheManager
@@ -35,14 +27,14 @@ logger = logging.getLogger(__name__)
 
 def translate_batch(
     words: Sequence[str],
-    client: OpenAI,
+    llm: Any,  # LangChain Chat Model
     rag_store: RAGStore,
     domain: str,
     formality: str,
     cache: Optional[CacheManager] = None,
 ) -> dict[str, str]:
     """
-    Translate a batch of English words, using cache and RAG.
+    Translate a batch of English words via the selected LLM provider.
     """
     results: dict[str, str] = {}
     remaining_words: list[str] = []
@@ -61,34 +53,33 @@ def translate_batch(
     if not remaining_words:
         return results
 
-    # 2. Translate remaining words via API
+    # 2. Get Tone Reference
     tone_context = retrieve_tone_context(remaining_words, rag_store, TOP_K_CHUNKS)
     system_prompt = _build_system_prompt(domain, formality, tone_context)
     user_msg      = _build_user_message(remaining_words)
 
+    # 3. Call LLM (LangChain style)
     api_results: dict[str, str] = {}
     for attempt in range(MAX_RETRIES):
         try:
-            response = client.chat.completions.create(
-                model=TRANSLATION_MODEL,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user",   "content": user_msg},
-                ],
-                temperature=TEMPERATURE,
-                max_tokens=MAX_TOKENS,
-            )
-            raw = response.choices[0].message.content.strip()
+            messages = [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_msg),
+            ]
+            
+            response = llm.invoke(messages)
+            raw = str(response.content).strip()
+            
             api_results = _parse_json_response(raw)
             break
         except Exception as exc:
-            logger.warning(f"API error on attempt {attempt + 1}: {exc}")
+            logger.warning(f"LLM API error (attempt {attempt + 1}): {exc}")
             if attempt < MAX_RETRIES - 1:
                 time.sleep(2 ** attempt)
             else:
-                st.error(f"❌ Batch translation failed: {exc}")
+                st.error(f"❌ Translation failed: {exc}")
 
-    # 3. Cache and combine results
+    # 4. Cache new results
     if api_results:
         for word, dutch in api_results.items():
             if cache:
@@ -100,13 +91,13 @@ def translate_batch(
 
 def translate_single(
     word: str,
-    client: OpenAI,
+    llm: Any,
     rag_store: RAGStore,
     domain: str,
     formality: str,
     cache: Optional[CacheManager] = None,
 ) -> str:
-    """Fallback single-word translation with cache check."""
+    """Fallback single-word translation via any provider."""
     if cache:
         cached = cache.get(domain, formality, word)
         if cached:
@@ -116,32 +107,25 @@ def translate_single(
     system_prompt = _build_system_prompt(domain, formality, tone_context)
 
     try:
-        response = client.chat.completions.create(
-            model=TRANSLATION_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": f'Translate this English business word/phrase to Dutch.\n'
-                               f'Reply with ONLY the translation:\n\n"{word}"'
-                },
-            ],
-            temperature=TEMPERATURE,
-            max_tokens=60,
-        )
-        dutch = response.choices[0].message.content.strip().strip('"')
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=f'Translate ONLY the word "{word}" to Dutch.'),
+        ]
+        response = llm.invoke(messages)
+        dutch = str(response.content).strip().strip('"').strip("'")
+        
         if cache:
             cache.set(domain, formality, word, dutch)
         return dutch
     except Exception as exc:
-        logger.error(f"Single-word failed for '{word}': {exc}")
+        logger.error(f"Single-word fallback failed for '{word}': {exc}")
         return word
 
 
 # ── Prompt construction ───────────────────────────────────────────────────────
 
 def _build_system_prompt(domain: str, formality: str, tone_context: str) -> str:
-    formality_note = FORMALITY_OPTIONS.get(formality, FORMALITY_OPTIONS["Neutral"])
+    formality_note = FORMALITY_OPTIONS.get(formality, "Formal (u-form)")
     rag_block = f"\nTONE REFERENCE:\n\"\"\"\n{tone_context}\n\"\"\"\n" if tone_context.strip() else ""
 
     return f"""You are a professional Dutch business linguist.
@@ -149,18 +133,18 @@ DOMAIN: {domain}
 FORMALITY: {formality_note}
 {rag_block}
 RULES:
-1. Return ONLY a JSON mapping English -> Dutch.
-2. Preserve exact capitalisation.
-3. If brand/proper noun, keep English.
-4. Prioritize the tone reference vocabulary.
+1. Return ONLY a valid JSON object mapping English -> Dutch.
+2. Preserve capitalization.
+3. Keep brand names in English.
+4. IMPORTANT: JSON format only — no markdown blocks.
+5. Prioritize terminology from the tone reference.
 """
 
 
 def _build_user_message(words: list[str]) -> str:
     word_list = "\n".join(f'"{w}"' for w in words)
     return (
-        "Translate these words to Dutch.\n"
-        "Return ONLY a JSON object.\n\n"
+        "Translate these words to Dutch. Return ONLY the JSON object:\n\n"
         + word_list
     )
 
@@ -168,7 +152,17 @@ def _build_user_message(words: list[str]) -> str:
 # ── Response parsing ──────────────────────────────────────────────────────────
 
 def _parse_json_response(raw: str) -> dict[str, str]:
-    raw = re.sub(r"^```[a-z]*\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
-    data = json.loads(raw.strip())
-    return {str(k): str(v) for k, v in data.items()}
+    # Strip markdown fences (common in Claude/Gemini)
+    raw = re.sub(r"^```[a-z]*\s*", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"\s*```$", "", raw, flags=re.IGNORECASE)
+    
+    try:
+        data = json.loads(raw.strip())
+        return {str(k): str(v) for k, v in data.items()}
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON Parse Error: {e} | Raw: {raw}")
+        # Secondary regex attempt to find JSON body
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+        raise e
