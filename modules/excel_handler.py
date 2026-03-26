@@ -1,19 +1,24 @@
 """
-excel_handler.py — Read and write Excel workbooks.
+excel_handler.py — Targeted reading and writing for Excel workbooks.
 
 Responsibilities:
-  - Parse every sheet and extract (row, col, value) triples.
-  - Write translated values back into the original workbook structure,
-    preserving all formatting, styles, and non-word cells.
+  - Find "English" and "Dutch" columns in each sheet.
+  - Extract only text from the source column.
+  - Write translations back to the targeted Dutch column (next to English).
 """
 
 from __future__ import annotations
 
 import io
+import re
+import logging
 from dataclasses import dataclass
+from typing import Optional, Dict, List, Tuple
 
 from openpyxl import load_workbook
+from openpyxl.cell import Cell
 
+logger = logging.getLogger(__name__)
 
 # ── Data types ────────────────────────────────────────────────────────────────
 
@@ -22,40 +27,77 @@ class WordEntry:
     sheet: str
     row: int
     col: int
+    target_col: int
     value: str
 
+# ── Header Matching ───────────────────────────────────────────────────────────
+
+SOURCE_HEADER_REGEX = re.compile(r"^(english|en|source|original)$", re.IGNORECASE)
+TARGET_HEADER_REGEX = re.compile(r"^(dutch|nl|target|vertaling|translation)$", re.IGNORECASE)
+
+def _find_columns(ws) -> Tuple[Optional[int], Optional[int], int]:
+    """
+    Search first 5 rows for column indices of Source and Target.
+    Return (source_col, target_col, header_row_index).
+    """
+    source_col = None
+    target_col = None
+    header_row_idx = 0
+
+    # Look through first 5 rows to find headers
+    for row_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=5), start=1):
+        for cell in row:
+            val = str(cell.value).strip() if cell.value else ""
+            if not val:
+                continue
+            
+            if SOURCE_HEADER_REGEX.match(val):
+                source_col = cell.column
+                header_row_idx = row_idx
+            elif TARGET_HEADER_REGEX.match(val):
+                target_col = cell.column
+                header_row_idx = row_idx
+    
+    # Fallback: if no source found but sheet has data, assume Col 1 is source
+    if source_col is None:
+        source_col = 1
+        header_row_idx = 1
+    
+    # If no target found, use column next to source
+    if target_col is None:
+        target_col = source_col + 1
+        
+    return source_col, target_col, header_row_idx
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def read_word_entries(file_bytes: bytes) -> dict[str, list[WordEntry]]:
     """
-    Open an Excel workbook and extract every non-empty cell value.
-
-    Args:
-        file_bytes: Raw bytes of the .xlsx file.
-
-    Returns:
-        Dict keyed by sheet name, each value being a list of WordEntry objects.
+    Open an Excel workbook and extract words ONLY from the source English column.
     """
     wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
     result: dict[str, list[WordEntry]] = {}
 
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
+        source_col, target_col, header_row = _find_columns(ws)
+        
         entries: list[WordEntry] = []
-
-        for row in ws.iter_rows():
-            for cell in row:
-                val = _extract_value(cell.value)
-                if val:
-                    entries.append(
-                        WordEntry(
-                            sheet=sheet_name,
-                            row=cell.row,
-                            col=cell.column,
-                            value=val,
-                        )
+        
+        # Iterate only through the source column, starting below header
+        for row in ws.iter_rows(min_row=header_row + 1):
+            cell = row[source_col - 1]
+            val = _extract_value(cell.value)
+            if val:
+                entries.append(
+                    WordEntry(
+                        sheet=sheet_name,
+                        row=cell.row,
+                        col=cell.column,
+                        target_col=target_col,
+                        value=val,
                     )
+                )
 
         if entries:
             result[sheet_name] = entries
@@ -69,16 +111,7 @@ def write_translations(
     translation_cache: dict[str, str],
 ) -> bytes:
     """
-    Apply translations to the original workbook (in-memory) and return
-    the modified workbook as bytes, preserving all styles and formatting.
-
-    Args:
-        original_bytes:    Raw bytes of the source .xlsx file.
-        sheet_entries:     Output of read_word_entries() for reference.
-        translation_cache: Mapping {english_word: dutch_word}.
-
-    Returns:
-        Bytes of the translated .xlsx file.
+    Apply translations specifically to the targeted Dutch column.
     """
     wb = load_workbook(io.BytesIO(original_bytes))
 
@@ -86,9 +119,11 @@ def write_translations(
         if sheet_name not in wb.sheetnames:
             continue
         ws = wb[sheet_name]
+        
         for entry in entries:
             dutch = translation_cache.get(entry.value, entry.value)
-            ws.cell(row=entry.row, column=entry.col).value = dutch
+            # Write specifically to the target_col (NOT overwriting English)
+            ws.cell(row=entry.row, column=entry.target_col).value = dutch
 
     buf = io.BytesIO()
     wb.save(buf)
