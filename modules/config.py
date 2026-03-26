@@ -1,6 +1,6 @@
 """
 config.py — Central configuration for the Dutch translator.
-Updated for Multi-Model support (OpenAI, Anthropic, Google).
+Updated for Multi-Model support (OpenAI, Anthropic, Google, and Local).
 """
 
 # ── Providers & Models ────────────────────────────────────────────────────────
@@ -11,11 +11,15 @@ PROVIDERS = {
     },
     "Anthropic": {
         "chat_model": "claude-3-5-sonnet-20240620",
-        "embed_model": None,  # Anthropic doesn't have native embeddings API yet
+        "embed_model": None,
     },
     "Google": {
         "chat_model": "gemini-1.5-pro",
         "embed_model": "models/embedding-001",
+    },
+    "Local (Helsinki-NLP)": {
+        "chat_model": "Helsinki-NLP/opus-mt-en-nl",
+        "embed_model": None,  # Local model doesn't use RAG in the same way
     }
 }
 

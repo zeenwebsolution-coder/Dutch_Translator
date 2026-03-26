@@ -1,17 +1,18 @@
 """
 model_factory.py — Unified Chat Model factory for multi-provider support.
-Supports OpenAI, Anthropic (Claude), and Google (Gemini).
+Updated to include local translation via Hugging Face Pipeline.
 """
 
-from typing import Optional
+from typing import Optional, Any
 from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
 from langchain_google_genai import ChatGoogleGenerativeAI
 from modules.config import PROVIDERS, TEMPERATURE, MAX_TOKENS
+from modules.local_translator import get_local_pipeline
 
-def get_chat_model(provider: str, api_key: str):
+def get_chat_model(provider: str, api_key: str) -> Any:
     """
-    Returns a LangChain Chat Model instance for the given provider.
+    Returns a unified translation engine (LLM or Pipeline) for the given provider.
     """
     conf = PROVIDERS.get(provider)
     if not conf:
@@ -19,6 +20,11 @@ def get_chat_model(provider: str, api_key: str):
 
     model_name = conf["chat_model"]
 
+    # 1. Local Model Case
+    if provider == "Local (Helsinki-NLP)":
+        return get_local_pipeline()
+
+    # 2. API-Based Models
     if provider == "OpenAI":
         return ChatOpenAI(
             model=model_name,
@@ -41,4 +47,4 @@ def get_chat_model(provider: str, api_key: str):
             max_output_tokens=MAX_TOKENS,
         )
     else:
-        raise ValueError(f"Unknown provider logic for: {provider}")
+        raise ValueError(f"Unknown provider: {provider}")

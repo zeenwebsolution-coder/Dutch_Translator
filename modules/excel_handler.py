@@ -112,6 +112,7 @@ def write_translations(
 ) -> bytes:
     """
     Apply translations specifically to the targeted Dutch column.
+    Safely handles MergedCells which are read-only.
     """
     wb = load_workbook(io.BytesIO(original_bytes))
 
@@ -122,8 +123,16 @@ def write_translations(
         
         for entry in entries:
             dutch = translation_cache.get(entry.value, entry.value)
-            # Write specifically to the target_col (NOT overwriting English)
-            ws.cell(row=entry.row, column=entry.target_col).value = dutch
+            
+            # Access the cell object
+            cell = ws.cell(row=entry.row, column=entry.target_col)
+            
+            # Check if it's a MergedCell (which is read-only)
+            if isinstance(cell, MergedCell):
+                logger.debug(f"Skipping MergedCell at {sheet_name} R{entry.row} C{entry.target_col}")
+                continue
+                
+            cell.value = dutch
 
     buf = io.BytesIO()
     wb.save(buf)
