@@ -1,12 +1,8 @@
 """
 app.py — Streamlit UI for the Dutch Business Translator.
 
-Orchestrates all modules:
-  tone_loader   → load & clean Dutch reference text
-  rag_engine    → LangChain FAISS vector store for tone retrieval
-  excel_handler → parse words from Excel, write translations back
-  translator    → GPT-4o-mini calls (smart dynamic batch sizing)
-  zip_handler   → unpack zip uploads, repack translated files into zip
+Targeted Excel logic + Persistent User-wise Cache (SQLite).
+Automatically finds "English" columns and writes to "Dutch" columns next to them.
 """
 
 import os
@@ -26,6 +22,7 @@ from modules.excel_handler import (
     total_word_count,
 )
 from modules.translator import translate_batch, translate_single
+from modules.cache_manager import CacheManager
 from modules.zip_handler import (
     extract_excel_files,
     pack_single,
@@ -73,12 +70,6 @@ h1  { font-size:1.65rem !important; margin:0 !important; }
     border-radius:8px; padding:.35rem .85rem; font-size:.82rem;
     margin:.3rem 0; font-weight:500; border: 1px solid #bbf7d0;
 }
-.stButton>button {
-    background:#2563eb; color:white; border:none; border-radius:8px;
-    padding:.6rem 2rem; font-weight:600; font-size:1rem; width:100%;
-    margin-top:.4rem; transition:background .2s;
-}
-.stButton>button:hover { background:#1d4ed8; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -90,25 +81,30 @@ st.markdown("""
     <h1>English → Dutch Business Translator</h1>
   </div>
   <p class="sub">
-    Upload a single Excel file <em>or a ZIP of multiple Excel files</em>.<br>
-    LangChain RAG retrieves the most relevant tone examples per batch —
-    GPT-4o-mini translates with smart auto-sized batches for optimal accuracy.
+    <strong>Improved!</strong> Targeting the "English" column specifically and writing to the "Dutch" column next to it.<br>
+    Includes <strong>Persistent Cache</strong> — translations stay intact on Streamlit Cloud (user-wise).
   </p>
 </div>
 """, unsafe_allow_html=True)
 
-# ── Step 0: API key ───────────────────────────────────────────────────────────
-with st.expander("🔑 OpenAI API Key", expanded=not bool(env_api_key)):
-    api_key = st.text_input(
+# ── Step 0: API key & Cache ───────────────────────────────────────────────────
+cache: CacheManager = None
+
+with st.expander("🔑 Setup & Persistent Cache Memory", expanded=not bool(env_api_key)):
+    api_key_input = st.text_input(
         "Enter your OpenAI API key",
         value=env_api_key,
         type="password",
         placeholder="sk-…",
     )
-    if env_api_key:
-        st.caption("✅ Pre-loaded from .env file. You can override it above.")
+    if api_key_input:
+        cache = CacheManager(api_key_input)
+        st.markdown(f"💾 **Cache Storage**: {cache.get_stats()} translations remembered for your key.")
+        if st.button("🧹 Clear User Cache"):
+            cache.clear()
+            st.success("User cache cleared!")
     else:
-        st.caption("Used only for this session. Never stored or logged.")
+        st.caption("Enter your API key to activate persistent translation memory.")
 
 # ── Step 1: File uploads ──────────────────────────────────────────────────────
 st.markdown('<div class="card"><p class="step">Step 1 — Upload files</p>',
@@ -117,22 +113,13 @@ st.markdown('<div class="card"><p class="step">Step 1 — Upload files</p>',
 col1, col2 = st.columns(2)
 with col1:
     main_upload = st.file_uploader(
-        "📊 Excel file(s)",
+        "📊 Excel file(s) (Targeting 'English' column)",
         type=["xlsx", "zip"],
-        help=(
-            "Single .xlsx  →  returns one translated .xlsx\n"
-            ".zip of .xlsx files  →  returns a translated .zip\n"
-            "Nested folders inside zip are supported."
-        ),
     )
 with col2:
     tone_file = st.file_uploader(
         "📄 Dutch tone reference (optional)",
         type=["doc", "docx", "txt", "rtf", "csv", "xlsx", "xls", "pdf"],
-        help=(
-            "Any Dutch business document that defines the tone to match.\n"
-            "Accepted: .doc  .docx  .txt  .rtf  .csv  .xlsx  .xls  .pdf"
-        ),
     )
 
 st.markdown('</div>', unsafe_allow_html=True)
@@ -148,53 +135,28 @@ with col_b:
     formality = st.selectbox("Formality level", list(FORMALITY_OPTIONS.keys()))
 
 st.markdown(
-    '<div class="info">⚡ <strong>Smart batching</strong> — batch size is automatically '
-    'optimized per file based on the number of unique words. Smaller files use larger '
-    'batches (fewer API calls), larger files use efficient chunking.</div>',
+    '<div class="info">💡 <strong>Excel Tip</strong>: If your sheets have columns labeled "English" or "EN", '
+    'the app will find them automatically and write results into the "Dutch" column next to them.</div>',
     unsafe_allow_html=True,
 )
 st.markdown('</div>', unsafe_allow_html=True)
 
-# ── Parse & preview uploaded files ───────────────────────────────────────────
+# ── Parse & preview ───────────────────────────────────────────────────────────
 excel_sources = []
 tone_text     = ""
 
 if main_upload:
     try:
         excel_sources = extract_excel_files(main_upload)
-        pills = "".join(
-            f'<span class="file-pill">📄 {s.name}</span>'
-            for s in excel_sources
-        )
-        st.markdown(
-            f'<div class="ok">✅ {len(excel_sources)} Excel file(s) ready:<br>{pills}</div>',
-            unsafe_allow_html=True,
-        )
-
-        with st.expander(f"Preview: {excel_sources[0].name}", expanded=True):
-            first_entries = read_word_entries(excel_sources[0].data)
-            tabs = st.tabs(list(first_entries.keys())[:6])
-            for tab, sname in zip(tabs, list(first_entries.keys())[:6]):
-                with tab:
-                    entries = first_entries[sname]
-                    st.caption(f"{len(entries)} word(s)")
-                    for e in entries[:6]:
-                        st.markdown(f"- {e.value}")
-                    if len(entries) > 6:
-                        st.caption(f"… and {len(entries)-6} more")
-
+        pills = "".join(f'<span class="file-pill">📄 {s.name}</span>' for s in excel_sources)
+        st.markdown(f'<div class="ok">✅ {len(excel_sources)} file(s) ready:<br>{pills}</div>', unsafe_allow_html=True)
     except ZipHandlerError as exc:
         st.error(str(exc))
-        excel_sources = []
 
 if tone_file:
     try:
         tone_text = load_tone_file(tone_file)
-        st.markdown(
-            f'<div class="info">📚 Tone file loaded — '
-            f'{len(tone_text):,} chars ready for LangChain RAG indexing.</div>',
-            unsafe_allow_html=True,
-        )
+        st.info(f"📚 Tone file loaded ({len(tone_text)//1024} KB).")
     except ToneLoadError as exc:
         st.error(str(exc))
 
@@ -202,122 +164,77 @@ if tone_file:
 st.markdown('<div class="card"><p class="step">Step 3 — Translate</p>',
             unsafe_allow_html=True)
 
-ready = bool(api_key and excel_sources)
+ready = bool(api_key_input and excel_sources)
 if not ready:
-    st.markdown(
-        '<div class="warn">⚠️ Provide your API key and upload at least one '
-        'Excel file or ZIP to continue.</div>',
-        unsafe_allow_html=True,
-    )
+    st.markdown('<div class="warn">⚠️ API key and Excel file required.</div>', unsafe_allow_html=True)
 
-go = st.button("🚀 Translate all files to Dutch", disabled=not ready)
+go = st.button("🚀 Process Column-by-Column & Save to Cache", disabled=not ready)
 st.markdown('</div>', unsafe_allow_html=True)
 
 # ── Translation pipeline ──────────────────────────────────────────────────────
 if go and ready:
-    client = OpenAI(api_key=api_key)
+    client = OpenAI(api_key=api_key_input)
 
-    # ── Validate API key first ────────────────────────────────────────────
-    with st.spinner("🔑 Validating API key…"):
-        try:
-            client.models.list()
-        except Exception as exc:
-            st.error(
-                f"❌ **API Key Error**: Could not connect to OpenAI. "
-                f"Please check your API key.\n\nDetails: {exc}"
-            )
-            st.stop()
-    st.success("🔑 API key validated successfully.")
-
-    # ── Phase 1: Build RAG store once, shared across all files ────────────
+    # 1. Build RAG Store
     rag_store: RAGStore = RAGStore()
     if tone_text:
-        with st.spinner("🔍 Building LangChain RAG index from tone file…"):
+        with st.spinner("🔍 Building RAG index…"):
             try:
-                rag_store = build_rag_store(tone_text, api_key)
-                st.success(
-                    f"RAG index ready: {rag_store.chunk_count} tone chunks "
-                    f"embedded via LangChain FAISS."
-                )
-            except Exception as exc:
-                st.error(f"❌ Failed to build RAG index: {exc}")
-                st.warning("Continuing without tone context…")
-    else:
-        st.info("No tone file — using domain + formality context only.")
+                rag_store = build_rag_store(tone_text, api_key_input)
+                st.success(f"RAG ready: {rag_store.chunk_count} chunks embedded.")
+            except Exception as e:
+                st.error(f"RAG error: {e}")
 
-    # ── Phase 2: Translate each file (file-by-file with smart batching) ──
+    # 2. Translate File-by-File
     translated_outputs: list[tuple] = []
     all_summary_rows:   list[dict]  = []
 
     overall_bar    = st.progress(0)
-    overall_status = st.empty()
-
     for file_idx, source in enumerate(excel_sources):
-        overall_status.markdown(
-            f"**File {file_idx+1} / {len(excel_sources)} — `{source.name}`**"
-        )
+        st.markdown(f"---")
+        st.info(f"**Currently Processing: `{source.name}`**")
 
         sheet_entries = read_word_entries(source.data)
         all_unique    = unique_words(sheet_entries)
+        batch_size    = compute_batch_size(len(all_unique))
 
-        # ── Smart batch sizing for this file ──────────────────────────
-        batch_size = compute_batch_size(len(all_unique))
-        st.markdown(
-            f'<div class="batch-info">📐 <strong>{source.name}</strong>: '
-            f'{len(all_unique)} unique words → batch size = {batch_size}</div>',
-            unsafe_allow_html=True,
-        )
-
-        word_bar    = st.progress(0)
-        word_status = st.empty()
+        st.markdown(f'<div class="batch-info">Sheet Word Count: {len(all_unique)} | Smart Batch Size: {batch_size}</div>', unsafe_allow_html=True)
 
         translation_cache: dict[str, str] = {}
         processed = 0
+        word_bar    = st.progress(0)
 
         for i in range(0, len(all_unique), batch_size):
             batch = all_unique[i : i + batch_size]
-            batch_end = min(i + batch_size, len(all_unique))
-            word_status.markdown(
-                f"  ↳ translating words {i+1}–{batch_end} "
-                f"of {len(all_unique)}…"
-            )
-
-            result = translate_batch(batch, client, rag_store, domain, formality)
+            
+            # Use persistent cache if available
+            result = translate_batch(batch, client, rag_store, domain, formality, cache=cache)
 
             for word in batch:
-                translation_cache[word] = (
-                    result[word] if word in result
-                    else translate_single(word, client, rag_store, domain, formality)
-                )
+                translation_cache[word] = result.get(word, 
+                                          translate_single(word, client, rag_store, domain, formality, cache=cache))
                 processed += 1
                 word_bar.progress(min(processed / len(all_unique), 1.0))
 
-        word_status.markdown(
-            f"  ✅ `{source.name}` done — {len(all_unique)} unique words "
-            f"(batch size: {batch_size})."
-        )
-
-        translated_bytes = write_translations(
-            source.data, sheet_entries, translation_cache
-        )
+        # 3. Write specifically back to Dutch Column
+        translated_bytes = write_translations(source.data, sheet_entries, translation_cache)
         translated_outputs.append((source, translated_bytes))
 
+        # Summary for preview
         for sname, entries in sheet_entries.items():
             for e in entries:
                 all_summary_rows.append({
-                    "File":               source.name,
-                    "Sheet":              sname,
-                    "English":            e.value,
-                    "Dutch (translated)": translation_cache.get(e.value, e.value),
+                    "File": source.name,
+                    "English": e.value,
+                    "Dutch (translated)": translation_cache.get(e.value, "error"),
+                    "Target Column": f"Col {e.target_col}"
                 })
 
         overall_bar.progress((file_idx + 1) / len(excel_sources))
 
-    overall_status.markdown(
-        f"✅ **All {len(excel_sources)} file(s) translated successfully!**"
-    )
+    st.success("✅ **All processing completed!** Memory has been updated.")
 
-    # ── Phase 3: Package & download ───────────────────────────────────────
+    # 4. Final Download
     if len(translated_outputs) == 1:
         source, t_bytes = translated_outputs[0]
         dl_bytes, dl_name = pack_single(t_bytes, source.name)
@@ -326,26 +243,9 @@ if go and ready:
         dl_bytes, dl_name = pack_zip(translated_outputs)
         mime = "application/zip"
 
-    st.markdown("### 📋 Full translation summary")
-    st.dataframe(
-        pd.DataFrame(all_summary_rows), use_container_width=True, height=340
-    )
-
-    st.download_button(
-        label=f"⬇️ Download  {dl_name}",
-        data=dl_bytes,
-        file_name=dl_name,
-        mime=mime,
-    )
-    st.success(
-        f"🎉 {len(all_summary_rows)} translations across "
-        f"{len(excel_sources)} file(s). Download **{dl_name}** above."
-    )
+    st.download_button(label=f"⬇️ Download Translated File(s)", data=dl_bytes, file_name=dl_name, mime=mime)
+    st.dataframe(pd.DataFrame(all_summary_rows).head(50), use_container_width=True)
 
 # ── Footer ────────────────────────────────────────────────────────────────────
-st.markdown("""
-<hr style="margin-top:2rem;border:none;border-top:1px solid #e5e7eb">
-<p style="text-align:center;color:#9ca3af;font-size:.8rem">
-  Powered by GPT-4o-mini + LangChain RAG (FAISS) · Smart auto-batching · Dutch business localisation
-</p>
-""", unsafe_allow_html=True)
+st.markdown("""<hr><p style="text-align:center;color:#9ca3af;font-size:.8rem">
+  Smart Excel Handler + Persistent Cache Memory enabled.</p>""", unsafe_allow_html=True)

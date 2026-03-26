@@ -1,12 +1,11 @@
 """
-translator.py — GPT-4o-mini translation engine with LangChain RAG tone injection.
+translator.py — GPT-4o-mini translation engine with LangChain RAG & Persistent Cache.
 
 For every batch of English words:
-  1. Retrieve the most relevant tone chunks from the LangChain RAG store.
-  2. Build a precise system prompt containing domain, formality, and
-     the retrieved Dutch tone examples.
-  3. Call GPT-4o-mini and parse the JSON response.
-  4. Fall back to single-word mode if a batch call fails.
+  1. Check persistent SQLite cache for existing translations.
+  2. Retrieve relevant tone chunks via LangChain RAG for the remaining words.
+  3. Call OpenAI and parse the JSON response.
+  4. Update the persistent cache with new results.
 """
 
 from __future__ import annotations
@@ -16,10 +15,9 @@ import re
 import time
 import logging
 import streamlit as st
-from typing import Sequence
+from typing import Sequence, Dict, List, Optional
 
 from openai import OpenAI
-
 from modules.config import (
     TRANSLATION_MODEL,
     MAX_RETRIES,
@@ -29,9 +27,9 @@ from modules.config import (
     TOP_K_CHUNKS,
 )
 from modules.rag_engine import RAGStore, retrieve_tone_context
+from modules.cache_manager import CacheManager
 
 logger = logging.getLogger(__name__)
-
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
@@ -41,25 +39,34 @@ def translate_batch(
     rag_store: RAGStore,
     domain: str,
     formality: str,
+    cache: Optional[CacheManager] = None,
 ) -> dict[str, str]:
     """
-    Translate a batch of English words to Dutch using GPT-4o-mini + RAG context.
-
-    Args:
-        words:     English words / phrases to translate.
-        client:    Authenticated OpenAI client.
-        rag_store: Populated RAGStore (may be empty if no tone file given).
-        domain:    Business domain (e.g. "Finance & Accounting").
-        formality: Key from FORMALITY_OPTIONS.
-
-    Returns:
-        Dict mapping each English word to its Dutch translation.
-        On failure, returns an empty dict (caller handles fallback).
+    Translate a batch of English words, using cache and RAG.
     """
-    tone_context = retrieve_tone_context(list(words), rag_store, TOP_K_CHUNKS)
-    system_prompt = _build_system_prompt(domain, formality, tone_context)
-    user_msg      = _build_user_message(list(words))
+    results: dict[str, str] = {}
+    remaining_words: list[str] = []
 
+    # 1. Check cache first
+    if cache:
+        for word in words:
+            cached = cache.get(domain, formality, word)
+            if cached:
+                results[word] = cached
+            else:
+                remaining_words.append(word)
+    else:
+        remaining_words = list(words)
+
+    if not remaining_words:
+        return results
+
+    # 2. Translate remaining words via API
+    tone_context = retrieve_tone_context(remaining_words, rag_store, TOP_K_CHUNKS)
+    system_prompt = _build_system_prompt(domain, formality, tone_context)
+    user_msg      = _build_user_message(remaining_words)
+
+    api_results: dict[str, str] = {}
     for attempt in range(MAX_RETRIES):
         try:
             response = client.chat.completions.create(
@@ -72,20 +79,23 @@ def translate_batch(
                 max_tokens=MAX_TOKENS,
             )
             raw = response.choices[0].message.content.strip()
-            return _parse_json_response(raw)
-
-        except json.JSONDecodeError as exc:
-            logger.warning("JSON parse error on attempt %d: %s", attempt + 1, exc)
-            st.warning(f"⚠️ JSON parse error (attempt {attempt + 1}/{MAX_RETRIES}): {exc}")
+            api_results = _parse_json_response(raw)
+            break
         except Exception as exc:
-            logger.warning("API error on attempt %d: %s", attempt + 1, exc)
-            st.warning(f"⚠️ API error (attempt {attempt + 1}/{MAX_RETRIES}): {exc}")
+            logger.warning(f"API error on attempt {attempt + 1}: {exc}")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(2 ** attempt)
+            else:
+                st.error(f"❌ Batch translation failed: {exc}")
 
-        if attempt < MAX_RETRIES - 1:
-            time.sleep(2 ** attempt)   # exponential back-off
-
-    st.error("❌ Batch translation failed after all retries. Falling back to single-word mode.")
-    return {}   # signal to caller: use single-word fallback
+    # 3. Cache and combine results
+    if api_results:
+        for word, dutch in api_results.items():
+            if cache:
+                cache.set(domain, formality, word, dutch)
+            results[word] = dutch
+    
+    return results
 
 
 def translate_single(
@@ -94,12 +104,14 @@ def translate_single(
     rag_store: RAGStore,
     domain: str,
     formality: str,
+    cache: Optional[CacheManager] = None,
 ) -> str:
-    """
-    Translate one word.  Used as the fallback when a batch call fails.
+    """Fallback single-word translation with cache check."""
+    if cache:
+        cached = cache.get(domain, formality, word)
+        if cached:
+            return cached
 
-    Returns the original English word if translation is not possible.
-    """
     tone_context  = retrieve_tone_context([word], rag_store, top_k=3)
     system_prompt = _build_system_prompt(domain, formality, tone_context)
 
@@ -110,74 +122,45 @@ def translate_single(
                 {"role": "system", "content": system_prompt},
                 {
                     "role": "user",
-                    "content": (
-                        f'Translate this English business word/phrase to Dutch.\n'
-                        f'Reply with ONLY the Dutch translation — no explanation, '
-                        f'no punctuation, no extra text.\n\n"{word}"'
-                    ),
+                    "content": f'Translate this English business word/phrase to Dutch.\n'
+                               f'Reply with ONLY the translation:\n\n"{word}"'
                 },
             ],
             temperature=TEMPERATURE,
             max_tokens=60,
         )
-        return response.choices[0].message.content.strip().strip('"')
+        dutch = response.choices[0].message.content.strip().strip('"')
+        if cache:
+            cache.set(domain, formality, word, dutch)
+        return dutch
     except Exception as exc:
-        logger.error("Single-word translation failed for '%s': %s", word, exc)
-        st.error(f"❌ Failed to translate '{word}': {exc}")
-        return word   # keep original on total failure
+        logger.error(f"Single-word failed for '{word}': {exc}")
+        return word
 
 
 # ── Prompt construction ───────────────────────────────────────────────────────
 
 def _build_system_prompt(domain: str, formality: str, tone_context: str) -> str:
     formality_note = FORMALITY_OPTIONS.get(formality, FORMALITY_OPTIONS["Neutral"])
+    rag_block = f"\nTONE REFERENCE:\n\"\"\"\n{tone_context}\n\"\"\"\n" if tone_context.strip() else ""
 
-    rag_block = ""
-    if tone_context.strip():
-        rag_block = f"""
-TONE REFERENCE — most relevant Dutch excerpts retrieved for this batch:
-\"\"\"
-{tone_context}
-\"\"\"
-Study these excerpts carefully.  Match their exact vocabulary style,
-register, and terminology.  These are the gold standard for this translation.
-"""
-
-    return f"""You are a highly experienced Dutch business linguist and certified terminologist.
-
+    return f"""You are a professional Dutch business linguist.
 DOMAIN: {domain}
 FORMALITY: {formality_note}
 {rag_block}
-TRANSLATION RULES — follow these without any exception:
-
-1. Return ONLY a valid JSON object mapping each English input to its Dutch translation.
-   Format exactly: {{"word1": "vertaling1", "word2": "vertaling2"}}
-   No markdown fences, no explanations, no extra keys, no trailing commas.
-
-2. Preserve capitalisation exactly:
-   - ALL CAPS input  → ALL CAPS output
-   - Title Case input → Title Case output
-   - lowercase input  → lowercase output
-
-3. For proper nouns, brand names, or abbreviations with no Dutch equivalent,
-   keep the original English form unchanged.
-
-4. Choose the Dutch term that a native Dutch-speaking professional in the
-   domain of "{domain}" would immediately recognise as the correct equivalent.
-
-5. When the tone reference is provided, prioritise vocabulary and phrasing
-   consistent with that reference over generic dictionary translations.
-
-6. Never invent translations.  If a term is genuinely untranslatable,
-   return the original English word.
+RULES:
+1. Return ONLY a JSON mapping English -> Dutch.
+2. Preserve exact capitalisation.
+3. If brand/proper noun, keep English.
+4. Prioritize the tone reference vocabulary.
 """
 
 
 def _build_user_message(words: list[str]) -> str:
     word_list = "\n".join(f'"{w}"' for w in words)
     return (
-        "Translate each of the following English words/phrases to Dutch.\n"
-        "Return ONLY a JSON object — no markdown, no extra text.\n\n"
+        "Translate these words to Dutch.\n"
+        "Return ONLY a JSON object.\n\n"
         + word_list
     )
 
@@ -185,9 +168,7 @@ def _build_user_message(words: list[str]) -> str:
 # ── Response parsing ──────────────────────────────────────────────────────────
 
 def _parse_json_response(raw: str) -> dict[str, str]:
-    """Strip markdown fences and parse the JSON from GPT's response."""
     raw = re.sub(r"^```[a-z]*\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
-    raw = raw.strip()
-    data = json.loads(raw)
+    data = json.loads(raw.strip())
     return {str(k): str(v) for k, v in data.items()}
