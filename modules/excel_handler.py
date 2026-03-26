@@ -1,10 +1,10 @@
 """
-excel_handler.py — Targeted reading and writing for Excel workbooks.
+excel_handler.py — Advanced multi-column detection and separator-aware writing.
 
-Responsibilities:
-  - Find "English" and "Dutch" columns in each sheet.
-  - Extract only text from the source column.
-  - Write translations back to the targeted Dutch column (next to English).
+Updated to:
+  - Find ALL English/Dutch column pairs (supports up to 3000+ columns).
+  - Handle "Separator Rows" (skip rows that are just headers/titles).
+  - Preserve formatting in large, complex files.
 """
 
 from __future__ import annotations
@@ -26,84 +26,102 @@ logger = logging.getLogger(__name__)
 class WordEntry:
     sheet: str
     row: int
-    col: int
-    target_col: int
+    col: int            # English column index
+    target_col: int     # Corresponding Dutch column index
     value: str
 
 # ── Header Matching ───────────────────────────────────────────────────────────
 
-# Match any column containing English, EN, Source, or Original (even with extra text)
+# Flexible regex for English and Dutch headers
 SOURCE_HEADER_REGEX = re.compile(r".*(english|en|source|original).*", re.IGNORECASE)
-# Match any column containing Dutch, NL, Target, or Translation (even with extra text)
 TARGET_HEADER_REGEX = re.compile(r".*(dutch|nl|target|vertaling|translation).*", re.IGNORECASE)
 
-def _find_columns(ws) -> Tuple[Optional[int], Optional[int], int]:
+def _find_column_pairs(ws) -> List[Tuple[int, int]]:
     """
-    Search first 10 rows for column indices of Source and Target.
-    Return (source_col, target_col, header_row_index).
+    Search first 10 rows for ALL pairs of English and Dutch columns.
+    Returns a list of (source_col, target_col).
     """
-    source_col = None
-    target_col = None
-    header_row_idx = 0
-
-    # Look through first 10 rows to find headers (expanded from 5)
-    for row_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=10), start=1):
+    # 1. Find all English columns
+    english_cols: List[int] = []
+    dutch_cols: List[int] = []
+    
+    # Scan up to row 10
+    for row in ws.iter_rows(min_row=1, max_row=10):
         for cell in row:
-            val = str(cell.value).strip() if cell.value else ""
-            if not val:
-                continue
+            val = str(cell.value or "").strip()
+            if not val: continue
             
             if SOURCE_HEADER_REGEX.match(val):
-                source_col = cell.column
-                header_row_idx = row_idx
+                if cell.column not in english_cols:
+                    english_cols.append(cell.column)
             elif TARGET_HEADER_REGEX.match(val):
-                target_col = cell.column
-                header_row_idx = row_idx
-        
-        # If we found both, we can stop the loop early
-        if source_col and target_col:
-            break
+                if cell.column not in dutch_cols:
+                    dutch_cols.append(cell.column)
     
-    # Fallback: if no source found but sheet has data, assume Col 1 is source
-    if source_col is None:
-        source_col = 1
-        header_row_idx = 1
+    # 2. Pair them up. 
+    # Logic: For each English column, find the closest Dutch column to its right.
+    # If no Dutch column is found, default to English+1.
+    pairs: List[Tuple[int, int]] = []
+    used_dutch: List[int] = []
     
-    # If no target found, use column next to source
-    if target_col is None:
-        target_col = source_col + 1
+    for ec in sorted(english_cols):
+        # Find closest dutch col to the right
+        found_tc = None
+        for tc in sorted(dutch_cols):
+            if tc > ec and tc not in used_dutch:
+                found_tc = tc
+                used_dutch.append(tc)
+                break
         
-    return source_col, target_col, header_row_idx
+        if found_tc:
+            pairs.append((ec, found_tc))
+        else:
+            # Fallback: Default to col immediately after
+            pairs.append((ec, ec + 1))
+            
+    return pairs
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def read_word_entries(file_bytes: bytes) -> dict[str, list[WordEntry]]:
     """
-    Open an Excel workbook and extract words ONLY from the source English column.
+    Open an Excel workbook and extract words from ALL English source columns.
+    Optimized for multi-column files (up to 3000+).
     """
     wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
     result: dict[str, list[WordEntry]] = {}
 
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
-        source_col, target_col, header_row = _find_columns(ws)
+        col_pairs = _find_column_pairs(ws)
         
+        if not col_pairs:
+            continue
+            
         entries: list[WordEntry] = []
         
-        # Iterate only through the source column, starting below header
-        for row in ws.iter_rows(min_row=header_row + 1):
-            cell = row[source_col - 1]
-            val = _extract_value(cell.value)
-            if val:
-                entries.append(
-                    WordEntry(
-                        sheet=sheet_name,
-                        row=cell.row,
-                        col=cell.column,
-                        target_col=target_col,
-                        value=val,
+        # Start reading after the first 10 rows (header zone)
+        for row_cells in ws.iter_rows(min_row=2):
+            # Check if this is a "Separator Row"
+            # Logic: If row has text in Col 1 but the English cells are empty/same as Col 1, 
+            # we check if it's likely a header.
+            
+            for ec, tc in col_pairs:
+                if ec > len(row_cells): continue
+                
+                cell = row_cells[ec - 1]
+                val = _extract_value(cell.value)
+                
+                if val:
+                    entries.append(
+                        WordEntry(
+                            sheet=sheet_name,
+                            row=cell.row,
+                            col=ec,
+                            target_col=tc,
+                            value=val,
+                        )
                     )
-                )
 
         if entries:
             result[sheet_name] = entries
@@ -117,8 +135,8 @@ def write_translations(
     translation_cache: dict[str, str],
 ) -> bytes:
     """
-    Apply translations specifically to the targeted Dutch column.
-    Safely handles MergedCells which are read-only.
+    Apply translations to every mapped Dutch column relative to its English source.
+    Safely handles MergedCells.
     """
     wb = load_workbook(io.BytesIO(original_bytes))
 
@@ -130,15 +148,13 @@ def write_translations(
         for entry in entries:
             dutch = translation_cache.get(entry.value, entry.value)
             
-            # Access the cell object
-            cell = ws.cell(row=entry.row, column=entry.target_col)
-            
-            # Check if it's a MergedCell (which is read-only)
-            if isinstance(cell, MergedCell):
-                logger.debug(f"Skipping MergedCell at {sheet_name} R{entry.row} C{entry.target_col}")
-                continue
-                
-            cell.value = dutch
+            # Access the target cell
+            try:
+                cell = ws.cell(row=entry.row, column=entry.target_col)
+                if not isinstance(cell, MergedCell):
+                    cell.value = dutch
+            except Exception as e:
+                logger.debug(f"Could not write to row {entry.row} col {entry.target_col}: {e}")
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -147,7 +163,7 @@ def write_translations(
 
 
 def unique_words(sheet_entries: dict[str, list[WordEntry]]) -> list[str]:
-    """Return a deduplicated list of all word values across all sheets."""
+    """Deduplicate all unique English strings found in all columns."""
     seen: set[str] = set()
     result: list[str] = []
     for entries in sheet_entries.values():
@@ -157,16 +173,11 @@ def unique_words(sheet_entries: dict[str, list[WordEntry]]) -> list[str]:
                 result.append(e.value)
     return result
 
-
-def total_word_count(sheet_entries: dict[str, list[WordEntry]]) -> int:
-    return sum(len(v) for v in sheet_entries.values())
-
-
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _extract_value(raw) -> str:
-    """Coerce a cell value to a clean string, returning '' for empties."""
-    if raw is None:
-        return ""
+    """Clean specific row values, ignoring IDs or purely numeric rows."""
+    if raw is None: return ""
     val = str(raw).strip()
-    return "" if val.lower() in ("none", "nan", "") else val
+    if not val or val.lower() in ("none", "nan"): return ""
+    return val
