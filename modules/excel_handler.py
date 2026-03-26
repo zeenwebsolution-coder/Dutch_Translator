@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple
 
 from openpyxl import load_workbook
-from openpyxl.cell import Cell
+from openpyxl.cell import Cell, MergedCell
 
 logger = logging.getLogger(__name__)
 
