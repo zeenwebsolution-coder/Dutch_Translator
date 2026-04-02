@@ -100,17 +100,22 @@ def write_translations(
 
 
 def _replace_in_paragraph(paragraph: Paragraph, translation_cache: Dict[str, str]):
-    """
-    Replace text inside a paragraph run-by-run.
-    """
-    for run in paragraph.runs:
-        original_text = run.text
-        cleaned = _clean_text(original_text)
+    # Try full paragraph match first
+    full_text = _clean_text(paragraph.text)
+    if full_text and full_text in translation_cache:
+        translated = translation_cache[full_text]
+        # Put translation in first run, clear the rest
+        if paragraph.runs:
+            paragraph.runs[0].text = translated
+            for run in paragraph.runs[1:]:
+                run.text = ""
+        return
 
+    # Fallback: try run-by-run match
+    for run in paragraph.runs:
+        cleaned = _clean_text(run.text)
         if cleaned and cleaned in translation_cache:
             run.text = translation_cache[cleaned]
-
-
 # ── Utility ────────────────────────────────────────────────────────────────
 
 def unique_words(word_entries: Dict[str, List[str]]) -> List[str]:
