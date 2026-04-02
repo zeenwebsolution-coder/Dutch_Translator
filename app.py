@@ -5,7 +5,7 @@ app.py — Multi-Model Dutch Business Translator
 import os
 import streamlit as st
 from dotenv import load_dotenv
-
+import traceback
 from modules.config import compute_batch_size, PROVIDERS
 from modules.tone_loader import load_tone_from_path
 from modules.rag_engine import build_rag_store, RAGStore
@@ -191,6 +191,7 @@ with tab_batch:
 
         except Exception as e:
             st.error(f"❌ Error: {e}")
+            st.code(traceback.format_exc())
 
 # ====================================================
 # 💬 CHAT ASSISTANT
