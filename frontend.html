@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Dutch Translator</title>
+    <style>
+        body { font-family: Arial; max-width: 800px; margin: 50px auto; padding: 20px; }
+        textarea { width: 100%; height: 100px; margin: 10px 0; }
+        button { padding: 10px 20px; background: #0066cc; color: white; border: none; cursor: pointer; }
+        #result { margin-top: 20px; padding: 10px; background: #f0f0f0; }
+    </style>
+</head>
+<body>
+    <h1>🇳🇱 Dutch Translator</h1>
+    
+    <div>
+        <label>API Key:</label>
+        <input type="password" id="apiKey" style="width: 100%; margin: 10px 0;">
+    </div>
+    
+    <div>
+        <label>English Text:</label>
+        <textarea id="text" placeholder="Enter English text to translate..."></textarea>
+    </div>
+    
+    <button onclick="translate()">Translate</button>
+    
+    <div id="result"></div>
+    
+    <script>
+        async function translate() {
+            const apiKey = document.getElementById('apiKey').value;
+            const text = document.getElementById('text').value;
+            
+            if (!apiKey || !text) {
+                alert('Please enter API key and text');
+                return;
+            }
+            
+            const response = await fetch('/translate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    text: [text],
+                    api_key: apiKey,
+                    provider: 'OpenAI'
+                })
+            });
+            
+            const data = await response.json();
+            document.getElementById('result').innerHTML = 
+                `<strong>Dutch:</strong> ${data.translations[text] || 'Error'}`;
+        }
+    </script>
+</body>
+</html>
